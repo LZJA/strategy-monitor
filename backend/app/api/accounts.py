@@ -9,12 +9,17 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.core.database import get_db
 from app.models import AccountSnapshot, User
-from app.schemas.accounts import PositionChangeOut, PositionQuoteOut, SnapshotIn, SnapshotOut
+from app.schemas.accounts import PositionChangeOut, PositionChartOut, PositionQuoteOut, SnapshotIn, SnapshotOut
+from app.api.signals import read_klines
 from app.services.accounts import attach_recent_signal_counts, get_position_quotes, infer_changes, upsert_snapshot
 from app.services.auth import get_current_user
 
 
 router = APIRouter(prefix="/account", tags=["account"])
+
+
+def normalize_symbol(value: str) -> str:
+    return value.strip().upper()
 
 
 @router.get("/position-quotes", response_model=list[PositionQuoteOut])
@@ -27,6 +32,49 @@ def position_quotes(
     del user
     symbol_list = [symbol for symbol in symbols.split(",") if symbol.strip()]
     return list(get_position_quotes(db, symbol_list, snapshot_date).values())
+
+
+@router.get("/positions/{symbol}/chart", response_model=PositionChartOut)
+def position_chart(
+    symbol: str,
+    snapshot_date: Optional[date] = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    target_symbol = normalize_symbol(symbol)
+    stmt = (
+        select(AccountSnapshot)
+        .where(AccountSnapshot.user_id == user.id)
+        .options(selectinload(AccountSnapshot.positions))
+        .order_by(desc(AccountSnapshot.snapshot_date))
+        .limit(1)
+    )
+    if snapshot_date:
+        stmt = (
+            select(AccountSnapshot)
+            .where(AccountSnapshot.user_id == user.id, AccountSnapshot.snapshot_date <= snapshot_date)
+            .options(selectinload(AccountSnapshot.positions))
+            .order_by(desc(AccountSnapshot.snapshot_date))
+            .limit(1)
+        )
+    snapshot = db.scalar(stmt)
+    if not snapshot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Snapshot not found")
+    position = next((item for item in snapshot.positions if normalize_symbol(item.symbol) == target_symbol), None)
+    if not position:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Position not found")
+    latest_price = position.latest_price
+    quote = get_position_quotes(db, [target_symbol], snapshot.snapshot_date).get(target_symbol)
+    if quote and quote.latest_price is not None:
+        latest_price = quote.latest_price
+    return PositionChartOut(
+        symbol=position.symbol,
+        name=position.name,
+        snapshot_date=snapshot.snapshot_date,
+        cost_price=position.cost_price,
+        latest_price=latest_price,
+        klines=read_klines(target_symbol, snapshot.snapshot_date),
+    )
 
 
 @router.get("/snapshots", response_model=list[SnapshotOut])

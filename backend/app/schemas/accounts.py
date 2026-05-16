@@ -5,6 +5,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.schemas.signals import KlineOut
+
 
 class PositionIn(BaseModel):
     symbol: str = Field(min_length=1, max_length=32)
@@ -71,3 +73,12 @@ class PositionQuoteOut(BaseModel):
     symbol: str
     name: Optional[str]
     latest_price: Optional[float]
+
+
+class PositionChartOut(BaseModel):
+    symbol: str
+    name: Optional[str]
+    snapshot_date: date
+    cost_price: float
+    latest_price: Optional[float]
+    klines: List[KlineOut]

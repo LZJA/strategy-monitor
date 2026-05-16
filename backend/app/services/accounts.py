@@ -9,7 +9,7 @@ from typing import List, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from app.core.config import ROOT_DIR, settings
+from app.core.config import ROOT_DIR
 from app.models import AccountPosition, AccountSnapshot, Signal
 from app.schemas.accounts import PositionChangeOut, PositionQuoteOut, SnapshotIn
 
@@ -30,7 +30,6 @@ def parse_float(value: object) -> Optional[float]:
 @lru_cache(maxsize=1)
 def load_code_name_map() -> dict[str, str]:
     paths = [
-        Path(settings.scanner_project_path) / "data" / "universe_cache" / "a_share_code_list.csv",
         ROOT_DIR / "data" / "universe_cache" / "a_share_code_list.csv",
     ]
     names: dict[str, str] = {}
@@ -50,7 +49,6 @@ def load_code_name_map() -> dict[str, str]:
 
 def latest_kline_close(symbol: str, snapshot_date: date) -> Optional[float]:
     paths = [
-        Path(settings.scanner_project_path) / "data" / "kline_cache" / f"{symbol}.csv",
         ROOT_DIR / "data" / "kline_cache" / f"{symbol}.csv",
     ]
     latest_close: Optional[float] = None

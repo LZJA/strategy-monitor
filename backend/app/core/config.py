@@ -17,11 +17,10 @@ class Settings(BaseSettings):
     registration_enabled: bool = True
     keep_scan_artifacts: bool = False
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
-    scanner_project_path: str = str(ROOT_DIR.parent / "a-share-pattern-scan-tool")
     scanner_board: str = "main_board"
     scanner_timeout_seconds: int = 1800
 
-    model_config = SettingsConfigDict(env_file=ROOT_DIR / ".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=ROOT_DIR / ".env", env_file_encoding="utf-8", extra="ignore")
 
     @property
     def cors_origin_list(self) -> list[str]:

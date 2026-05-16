@@ -30,6 +30,9 @@
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
+# windows
+# py -m venv .venv
+# .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
@@ -63,13 +66,11 @@ cp .env.example .env
 ```env
 REGISTRATION_ENABLED=0
 KEEP_SCAN_ARTIFACTS=0
-SCANNER_PROJECT_PATH=/Users/lizijian/项目/a-share-pattern-scan-tool
 SCANNER_BOARD=main_board
 ```
 
 - `REGISTRATION_ENABLED=0`：已有用户后关闭开放注册。
 - `KEEP_SCAN_ARTIFACTS=0`：CSV 入库成功后删除临时文件。
-- `SCANNER_PROJECT_PATH`：手动扫描按钮调用的形态扫描工具目录。
 - `SCANNER_BOARD`：手动扫描范围，常用值为 `main_board` 或 `all`。
 
 ## 数据原则
@@ -79,6 +80,18 @@ SCANNER_BOARD=main_board
 - 扫描成功入库后，默认删除 CSV/JSON 临时文件
 - 数据库保存用户、信号、账户快照、持仓状态
 - 回测产物不进入平台
+
+## 内置策略
+
+当前扫描器已内置以下策略，不依赖其他项目运行：
+
+- 颈线突破 / ABCD 形态扫描
+- 超短期热门
+- 地量地价观察
+- 低位长下影 + 急跌反抽
+- 趋势上涨 + 回踩放量延续
+
+策略参数集中在 `backend/app/scanner/scanner.env`。项目根目录 `.env` 中的同名变量会覆盖 `scanner.env`，便于本地临时调参。
 
 ## API 概览
 
@@ -121,9 +134,9 @@ POST /api/admin/scan/import-csv
 
 ## CSV 导入
 
-管理员登录后可在页面点击“扫描今日信号”，后端会优先调用 `SCANNER_PROJECT_PATH` 下的 `pattern_scan_tool.py`，扫描完成后导入当天 `*_matched.csv`；如果没有配置扫描工具，则读取 `data/scan_results/` 下最新的 CSV。重复点击会刷新当天信号，避免重复累加。
+管理员登录后可在页面点击“扫描今日信号”，后端会调用本项目内置的 `backend/app/scanner/pattern_scan_tool.py`，扫描结果写入 `data/pattern_scan_cache/` 后自动导入当天 `*_matched.csv`；如果内置扫描器不可用，则读取 `data/scan_results/` 下最新的 CSV。重复点击会刷新当天信号，避免重复累加。
 
-命中标的支持点击查看 K 线结构图。图表数据来自 `SCANNER_PROJECT_PATH/data/kline_cache/{代码}.csv`，并从扫描结果中的 `A点`、`B点`、`C点`、`D点` 字段解析形态标记。
+命中标的支持点击查看 K 线结构图。图表数据来自本项目 `data/kline_cache/{代码}.csv`，并从扫描结果中的 `A点`、`B点`、`C点`、`D点` 字段解析形态标记。
 
 也可以通过接口导入扫描 CSV。当前后端会识别常见中文列名：
 
@@ -136,4 +149,4 @@ POST /api/admin/scan/import-csv
 - `止损价`
 - `止盈价`
 
-后续可以继续接入 `a-share-pattern-scan-tool` 的扫描脚本，改成扫描完成后直接入库并清理产物。
+策略扫描逻辑已经内置在本项目中，不需要运行时跨项目调用外部扫描脚本。

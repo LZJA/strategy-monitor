@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from app.core.config import ROOT_DIR, settings
+from app.core.config import ROOT_DIR
 from app.core.database import get_db
 from app.models import Signal
 from app.schemas.signals import KlineOut, PatternPointOut, SignalChartOut, SignalOut
@@ -18,6 +18,7 @@ from app.services.auth import get_current_user
 
 
 router = APIRouter(prefix="/signals", tags=["signals"], dependencies=[Depends(get_current_user)])
+VISIBLE_SIGNAL_TYPES = {"matched", "confirmed", "命中", "确认", "突破", "突破回踩确认"}
 
 
 def to_signal_out(signal: Signal) -> SignalOut:
@@ -37,6 +38,24 @@ def parse_float(value: object) -> Optional[float]:
         return float(str(value).replace(",", ""))
     except ValueError:
         return None
+
+
+def cached_trading_dates() -> set[date]:
+    cache_dir = ROOT_DIR / "data" / "kline_cache"
+    sample = next((path for path in sorted(cache_dir.glob("*.csv")) if path.is_file()), None)
+    if not sample:
+        return set()
+    dates: set[date] = set()
+    with sample.open("r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            raw_date = row.get("Date") or row.get("date") or row.get("日期")
+            if not raw_date:
+                continue
+            try:
+                dates.add(date.fromisoformat(raw_date.strip()))
+            except ValueError:
+                continue
+    return dates
 
 
 def parse_pattern_point(label: str, value: object) -> Optional[PatternPointOut]:
@@ -78,7 +97,6 @@ def signal_points(signal: Signal) -> list[PatternPointOut]:
 
 def kline_file_path(symbol: str) -> Path:
     candidates = [
-        Path(settings.scanner_project_path) / "data" / "kline_cache" / f"{symbol}.csv",
         ROOT_DIR / "data" / "kline_cache" / f"{symbol}.csv",
     ]
     for path in candidates:
@@ -87,9 +105,10 @@ def kline_file_path(symbol: str) -> Path:
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"没有找到 {symbol} 的 K 线缓存")
 
 
-def read_klines(symbol: str, end_date: date, limit: int = 160) -> list[KlineOut]:
+def read_klines(symbol: str, end_date: date, limit: Optional[int] = None) -> list[KlineOut]:
     path = kline_file_path(symbol)
     rows: list[KlineOut] = []
+    prev_close: Optional[float] = None
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             raw_date = row.get("Date") or row.get("date") or row.get("日期")
@@ -107,6 +126,9 @@ def read_klines(symbol: str, end_date: date, limit: int = 160) -> list[KlineOut]
             close_price = parse_float(row.get("Close") or row.get("close") or row.get("收盘"))
             if None in (open_price, high_price, low_price, close_price):
                 continue
+            change_pct = None
+            if prev_close and prev_close > 0:
+                change_pct = (close_price or 0) / prev_close * 100 - 100
             rows.append(
                 KlineOut(
                     date=row_date,
@@ -116,9 +138,11 @@ def read_klines(symbol: str, end_date: date, limit: int = 160) -> list[KlineOut]
                     close=close_price or 0,
                     volume=parse_float(row.get("Volume") or row.get("volume") or row.get("成交量")),
                     amount=parse_float(row.get("Amount") or row.get("amount") or row.get("成交额")),
+                    change_pct=change_pct,
                 )
             )
-    return rows[-limit:]
+            prev_close = close_price
+    return rows[-limit:] if limit else rows
 
 
 @router.get("", response_model=list[SignalOut])
@@ -136,17 +160,24 @@ def list_signals(
         stmt = stmt.where(Signal.symbol == symbol)
     if strategy_name:
         stmt = stmt.where(Signal.strategy_name == strategy_name)
-    return [to_signal_out(signal) for signal in db.scalars(stmt).all()]
+    stmt = stmt.where(Signal.signal_type.in_(VISIBLE_SIGNAL_TYPES))
+    trading_dates = cached_trading_dates()
+    signals = db.scalars(stmt).all()
+    if trading_dates:
+        signals = [signal for signal in signals if signal.signal_date in trading_dates]
+    return [to_signal_out(signal) for signal in signals]
 
 
 @router.get("/today", response_model=list[SignalOut])
 def today_signals(db: Session = Depends(get_db)):
-    latest_date = db.scalar(select(Signal.signal_date).order_by(desc(Signal.signal_date)).limit(1))
+    trading_dates = cached_trading_dates()
+    signal_dates = db.scalars(select(Signal.signal_date).distinct().order_by(desc(Signal.signal_date))).all()
+    latest_date = next((signal_date for signal_date in signal_dates if not trading_dates or signal_date in trading_dates), None)
     if not latest_date:
         return []
     signals = db.scalars(
         select(Signal)
-        .where(Signal.signal_date == latest_date)
+        .where(Signal.signal_date == latest_date, Signal.signal_type.in_(VISIBLE_SIGNAL_TYPES))
         .order_by(Signal.strategy_name, Signal.signal_type, Signal.symbol)
     ).all()
     return [to_signal_out(signal) for signal in signals]
@@ -167,6 +198,9 @@ def signal_chart(signal_id: int, db: Session = Depends(get_db)):
 @router.get("/by-symbol/{symbol}", response_model=list[SignalOut])
 def by_symbol(symbol: str, db: Session = Depends(get_db)):
     signals = db.scalars(
-        select(Signal).where(Signal.symbol == symbol).order_by(desc(Signal.signal_date)).limit(200)
+        select(Signal)
+        .where(Signal.symbol == symbol, Signal.signal_type.in_(VISIBLE_SIGNAL_TYPES))
+        .order_by(desc(Signal.signal_date))
+        .limit(200)
     ).all()
     return [to_signal_out(signal) for signal in signals]

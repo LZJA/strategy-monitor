@@ -44,6 +44,7 @@ class KlineOut(BaseModel):
     close: float
     volume: Optional[float] = None
     amount: Optional[float] = None
+    change_pct: Optional[float] = None
 
 
 class PatternPointOut(BaseModel):

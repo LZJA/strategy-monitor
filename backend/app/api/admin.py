@@ -4,8 +4,10 @@ import csv
 import json
 import shutil
 import subprocess
+import sys
 from datetime import date, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -15,10 +17,12 @@ from sqlalchemy.orm import Session
 from app.core.config import ROOT_DIR, settings
 from app.core.database import get_db
 from app.models import ScanRun, Signal, User
+from app.scanner.daemon_strategies import run_daemon_strategy_scan
 from app.services.auth import require_admin
 
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+scan_lock = Lock()
 
 
 def parse_float(value: Optional[str]) -> Optional[float]:
@@ -46,14 +50,38 @@ def find_latest_scan_csv() -> Path:
     return max(csv_files, key=lambda path: path.stat().st_mtime)
 
 
-def run_external_scanner(signal_date: date) -> list[Path]:
-    scanner_dir = Path(settings.scanner_project_path)
-    scanner_script = scanner_dir / "pattern_scan_tool.py"
+def latest_cached_kline_date(max_date: date) -> Optional[date]:
+    cache_dir = ROOT_DIR / "data" / "kline_cache"
+    latest: Optional[date] = None
+    for path in cache_dir.glob("*.csv"):
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                last_line = ""
+                for line in handle:
+                    if line.strip():
+                        last_line = line
+            if not last_line or last_line.lower().startswith("date,"):
+                continue
+            row_date = date.fromisoformat(last_line.split(",", 1)[0].strip())
+        except (OSError, ValueError):
+            continue
+        if row_date <= max_date and (latest is None or row_date > latest):
+            latest = row_date
+    return latest
+
+
+def run_local_scanner(signal_date: date) -> list[Path]:
+    scanner_dir = ROOT_DIR
+    scanner_script = ROOT_DIR / "backend" / "app" / "scanner" / "pattern_scan_tool.py"
     if not scanner_script.exists():
         return []
 
-    python_bin = scanner_dir / ".venv" / "bin" / "python"
-    executable = str(python_bin if python_bin.exists() else "python3")
+    venv_python_candidates = [
+        ROOT_DIR / "backend" / ".venv" / "Scripts" / "python.exe",
+        ROOT_DIR / "backend" / ".venv" / "bin" / "python",
+    ]
+    python_bin = next((path for path in venv_python_candidates if path.exists()), None)
+    executable = str(python_bin or sys.executable)
     command = [
         executable,
         str(scanner_script),
@@ -61,20 +89,34 @@ def run_external_scanner(signal_date: date) -> list[Path]:
         "--date",
         signal_date.isoformat(),
     ]
-    result = subprocess.run(
-        command,
-        cwd=scanner_dir,
-        capture_output=True,
-        text=True,
-        timeout=settings.scanner_timeout_seconds,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=scanner_dir,
+            capture_output=True,
+            text=True,
+            timeout=settings.scanner_timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Local scanner Python is missing or not executable: {executable}",
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=f"Local scanner timed out after {settings.scanner_timeout_seconds} seconds",
+        ) from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "扫描脚本执行失败").strip()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail[-1000:])
 
-    output_dir = scanner_dir / "data" / "pattern_scan_cache" / signal_date.isoformat()
-    return sorted(path for path in output_dir.glob("*_matched.csv") if path.is_file())
+    output_dir = ROOT_DIR / "data" / "pattern_scan_cache" / signal_date.isoformat()
+    csv_files = sorted(path for path in output_dir.glob("*_matched.csv") if path.is_file())
+    csv_files.extend(sorted(path for path in output_dir.glob("*_watchlist.csv") if path.is_file()))
+    csv_files.extend(run_daemon_strategy_scan(ROOT_DIR, signal_date))
+    return csv_files
 
 
 def import_signal_csv(
@@ -107,6 +149,11 @@ def import_signal_csv(
             if not symbol:
                 continue
             payload = {k: v for k, v in row.items() if v not in (None, "")}
+            if row.get("payload_json"):
+                try:
+                    payload.update(json.loads(row["payload_json"]))
+                except json.JSONDecodeError:
+                    pass
             db.add(
                 Signal(
                     scan_run_id=scan_run.id,
@@ -139,33 +186,44 @@ def scan_today(
     admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    signal_date = date.today()
-    csv_files = run_external_scanner(signal_date)
-    if not csv_files:
-        csv_files = [find_latest_scan_csv()]
+    if not scan_lock.acquire(blocking=False):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="已有扫描任务正在运行，请稍后再试")
+    try:
+        signal_date = latest_cached_kline_date(date.today()) or date.today()
+        csv_files = run_local_scanner(signal_date)
+        if not csv_files:
+            csv_files = [find_latest_scan_csv()]
 
-    imported = 0
-    scan_run: Optional[ScanRun] = None
-    for index, csv_file in enumerate(csv_files):
-        current_run, current_imported = import_signal_csv(
-            db=db,
-            csv_file=csv_file,
-            signal_date=signal_date,
-            strategy_name="manual_scan",
-            signal_type="matched",
-            source=f"manual_scan:{admin.username}:{csv_file.name}",
-            replace_date=index == 0,
-        )
-        scan_run = current_run
-        imported += current_imported
+        imported = 0
+        scan_run: Optional[ScanRun] = None
+        for index, csv_file in enumerate(csv_files):
+            current_run, current_imported = import_signal_csv(
+                db=db,
+                csv_file=csv_file,
+                signal_date=signal_date,
+                strategy_name="manual_scan",
+                signal_type="watch" if "watchlist" in csv_file.stem else "matched",
+                source=f"manual_scan:{admin.username}:{csv_file.name}",
+                replace_date=index == 0,
+            )
+            scan_run = current_run
+            imported += current_imported
 
-    source_files = [str(path.relative_to(ROOT_DIR)) if path.is_relative_to(ROOT_DIR) else str(path) for path in csv_files]
-    return {
-        "scan_run_id": scan_run.id if scan_run else None,
-        "scan_date": signal_date,
-        "source_file": ", ".join(source_files),
-        "imported": imported,
-    }
+        source_files = [
+            str(path.relative_to(ROOT_DIR)) if path.is_relative_to(ROOT_DIR) else str(path) for path in csv_files
+        ]
+        if not settings.keep_scan_artifacts:
+            cache_root = ROOT_DIR / "data" / "pattern_scan_cache"
+            for folder in {path.parent for path in csv_files if path.is_relative_to(cache_root)}:
+                shutil.rmtree(folder, ignore_errors=True)
+        return {
+            "scan_run_id": scan_run.id if scan_run else None,
+            "scan_date": signal_date,
+            "source_file": ", ".join(source_files),
+            "imported": imported,
+        }
+    finally:
+        scan_lock.release()
 
 
 @router.post("/scan/import-csv")
@@ -200,3 +258,23 @@ async def import_csv(
         shutil.rmtree(run_dir, ignore_errors=True)
 
     return {"scan_run_id": scan_run.id, "imported": imported}
+
+
+@router.delete("/signals")
+def delete_signals(
+    signal_date: date,
+    strategy_name: Optional[str] = None,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    del admin
+    stmt = delete(Signal).where(Signal.signal_date == signal_date)
+    if strategy_name:
+        stmt = stmt.where(Signal.strategy_name == strategy_name)
+    result = db.execute(stmt)
+    db.commit()
+    return {
+        "deleted": result.rowcount or 0,
+        "signal_date": signal_date,
+        "strategy_name": strategy_name,
+    }

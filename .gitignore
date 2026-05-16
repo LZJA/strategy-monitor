@@ -4,6 +4,8 @@ data/app.db
 data/tmp/
 data/scan_results/
 data/kline_cache/
+data/universe_cache/
+data/pattern_scan_cache/
 backend/.venv/
 backend/__pycache__/
 backend/app/**/__pycache__/
