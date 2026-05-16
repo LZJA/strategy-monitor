@@ -163,7 +163,11 @@ def import_signal_csv(
                     symbol=symbol,
                     name=row.get("名称") or row.get("name"),
                     close_price=parse_float(
-                        row.get("收盘价") or row.get("当前价") or row.get("信号收盘价") or row.get("close_price")
+                        row.get("当前价")
+                        or row.get("信号当前价")
+                        or row.get("收盘价")
+                        or row.get("信号收盘价")
+                        or row.get("close_price")
                     ),
                     high_price=parse_float(row.get("最高价") or row.get("信号最高价") or row.get("high_price")),
                     breakout_price=parse_float(row.get("突破价") or row.get("breakout_price")),

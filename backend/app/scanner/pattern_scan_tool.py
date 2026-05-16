@@ -270,7 +270,7 @@ CSV_COLUMN_MAPPING = {
     "point_d_label": "D点",
     "signal_date": "信号日",
     "entry_date": "入场日",
-    "signal_close": "信号收盘价",
+    "signal_close": "信号当前价",
     "entry_open": "入场开盘价",
     "entry_gap": "入场涨跌幅",
     "breakout_price": "突破价",
@@ -297,7 +297,7 @@ CSV_COLUMN_MAPPING = {
     "quality_exit_price": "独立信号出场价格",
     "quality_exit_return": "独立信号收益率",
     "quality_holding_days": "独立信号持股天数",
-    "signal_close": "信号收盘价",
+    "signal_close": "信号当前价",
     "signal_high": "信号最高价",
     "close_gap_to_breakout": "距突破价差额",
     "close_gap_ratio": "距突破价差幅",
@@ -305,7 +305,7 @@ CSV_COLUMN_MAPPING = {
     "pullback_confirmed": "回踩确认",
     "pullback_date": "回踩确认日",
     "pullback_low": "回踩最低价",
-    "pullback_close": "回踩收盘价",
+    "pullback_close": "回踩当前价",
 }
 
 def _format_amount_brief(amount: Any) -> str:
@@ -1172,7 +1172,7 @@ def run_neckline_breakout_scan(
         f"模板={cfg.template_summary_text} "
         f"A/C为各模板窗口内高低点 "
         f"B/D为各模板右半段高低点 "
-        f"E=目标日期当天收盘价站上A-B连线 "
+        f"E=目标日期当天当前价站上A-B连线 "
         f"截止日期={target_date} "
         f"历史拉取天数={cfg.history_lookback_days} "
         f"并发={cfg.max_workers} "
@@ -1343,7 +1343,7 @@ def run_neckline_breakout_scan(
                 print(
                     f"[临近突破] {code},{name}  "
                     f"周期={watch_info['pattern_name']}  "
-                    f"收盘={watch_info['signal_close']}  "
+                    f"当前价={watch_info['signal_close']}  "
                     f"最高={watch_info['signal_high']}  "
                     f"突破价={watch_info['breakout_price']}  "
                     f"差额={watch_info['close_gap_to_breakout']}  "
@@ -1414,7 +1414,7 @@ def run_neckline_breakout_scan(
     else:
         print("[形态筛选] 无符合条件标的")
     if watch_rows:
-        print("[形态筛选] 临近突破观察名单(代码,名称,周期,收盘价,最高价,突破价,距突破差额,距突破差幅,A点,B点,C点,D点,盘中触线)：")
+        print("[形态筛选] 临近突破观察名单(代码,名称,周期,当前价,最高价,突破价,距突破差额,距突破差幅,A点,B点,C点,D点,盘中触线)：")
         for code, info in watch_rows:
             print(
                 f"{code},{info['name']},{info.get('pattern_name', '')},{info['signal_close']},{info['signal_high']},"

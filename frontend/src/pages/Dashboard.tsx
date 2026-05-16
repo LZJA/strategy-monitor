@@ -451,7 +451,7 @@ export function Dashboard({ user, onLogout }: Props) {
         {selectedSignal && (
           <div className="quote-strip">
             <span>日期 {selectedSignal.signal_date}</span>
-            <span>收盘 {selectedSignal.close_price ?? "--"}</span>
+            <span>当前价 {selectedSignal.close_price ?? "--"}</span>
             <span>最高 {selectedSignal.high_price ?? "--"}</span>
             <span>突破 {selectedSignal.breakout_price ?? "--"}</span>
             <span>止损 {selectedSignal.stop_loss_price ?? "--"}</span>
@@ -676,7 +676,7 @@ export function Dashboard({ user, onLogout }: Props) {
                     <th>类型</th>
                     <th>代码</th>
                     <th>名称</th>
-                    <th>收盘</th>
+                    <th>当前价</th>
                     <th>突破</th>
                     <th>排名</th>
                   </tr>

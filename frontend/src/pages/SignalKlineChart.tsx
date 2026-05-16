@@ -152,7 +152,7 @@ export function SignalKlineChart({ chart, loading, priceLines = [] }: Props) {
           return [
             `<div style="font-weight:600;margin-bottom:6px;">${first?.axisValue ?? kline.date}</div>`,
             `<div>开盘价：<b>${formatPrice(kline.open)}</b></div>`,
-            `<div>收盘价：<b>${formatPrice(kline.close)}</b></div>`,
+            `<div>当前价：<b>${formatPrice(kline.close)}</b></div>`,
             `<div>最低价：<b>${formatPrice(kline.low)}</b></div>`,
             `<div>最高价：<b>${formatPrice(kline.high)}</b></div>`,
             `<div>涨幅：<b>${formatPct(kline.change_pct)}</b></div>`,
