@@ -26,6 +26,11 @@ def build_ultra_short_hot_template(
         min_b_peak_prominence_ratio=env_float("ULTRA_SHORT_MIN_B_PEAK_PROMINENCE_RATIO", 0.02),
         post_d_peak_neighbor_days=env_int("LONG_LOCAL_EXTREMA_NEIGHBOR_DAYS", 2),
         min_breakout_over_d_ratio=env_float("ULTRA_SHORT_MIN_BREAKOUT_OVER_D_RATIO", 0.03),
+        adaptive_exit_enabled=bool(env_int("ULTRA_SHORT_ADAPTIVE_EXIT_ENABLED", 1)),
+        adaptive_exit_stop_atr_mult=env_float("ULTRA_SHORT_ADAPTIVE_EXIT_STOP_ATR_MULT", 2.0),
+        adaptive_exit_confirm_low_atr_buffer=env_float("ULTRA_SHORT_ADAPTIVE_EXIT_CONFIRM_LOW_ATR_BUFFER", 0.5),
+        adaptive_exit_take_profit_r=env_float("ULTRA_SHORT_ADAPTIVE_EXIT_TAKE_PROFIT_R", 1.0),
+        adaptive_exit_max_stop_loss_pct=env_float("ULTRA_SHORT_ADAPTIVE_EXIT_MAX_STOP_LOSS_PCT", 0.06),
         amount_rank_min=env_int("ULTRA_SHORT_AMOUNT_RANK_MIN", 200),
         amount_rank_max=env_int("ULTRA_SHORT_AMOUNT_RANK_MAX", 300),
     )
@@ -59,6 +64,57 @@ def _build_pattern_detail(
         e_close=float(closes.iloc[latest_idx]),
         e_high=float(highs.iloc[latest_idx]),
     )
+
+
+def _atr14(frame: pd.DataFrame) -> float:
+    if frame is None or frame.empty:
+        return 0.0
+    high = pd.to_numeric(frame["High"] if "High" in frame.columns else frame["Close"], errors="coerce")
+    low = pd.to_numeric(frame["Low"] if "Low" in frame.columns else frame["Close"], errors="coerce")
+    close = pd.to_numeric(frame["Close"], errors="coerce")
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [(high - low).abs(), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.rolling(14, min_periods=5).mean().iloc[-1]
+    return float(atr) if pd.notna(atr) and float(atr) > 0 else 0.0
+
+
+def _apply_adaptive_exit_plan(
+    frame: pd.DataFrame,
+    detail: Any,
+    latest_idx: int,
+    *,
+    stop_atr_mult: float,
+    confirm_low_atr_buffer: float,
+    take_profit_r: float,
+    max_stop_loss_pct: float,
+) -> None:
+    signal_price = float(detail.e_close or detail.breakout_price or 0.0)
+    if signal_price <= 0:
+        return
+    atr = _atr14(frame)
+    if atr <= 0:
+        return
+
+    lows = frame["Low"]
+    signal_low = float(lows.iloc[latest_idx])
+    atr_stop = signal_price - float(stop_atr_mult) * atr
+    structure_stop = signal_low - float(confirm_low_atr_buffer) * atr
+    stop_candidates = [value for value in (atr_stop, structure_stop) if value > 0]
+    stop_loss = max(stop_candidates) if stop_candidates else 0.0
+    if stop_loss <= 0:
+        return
+    if stop_loss >= signal_price:
+        stop_loss = signal_price - max(atr, signal_price * 0.02)
+    stop_loss = max(stop_loss, signal_price * 0.01)
+    if max_stop_loss_pct > 0:
+        stop_loss = max(stop_loss, signal_price * (1.0 - float(max_stop_loss_pct)))
+    risk = max(signal_price - stop_loss, signal_price * 0.005)
+    detail.dynamic_stop_loss_price = round(float(stop_loss), 4)
+    detail.dynamic_take_profit_price = round(float(signal_price + float(take_profit_r) * risk), 4)
+    detail.dynamic_atr14 = round(float(atr), 4)
 
 
 def _candidate_pattern_is_valid(
@@ -135,15 +191,15 @@ def _passes_peak_prominence_filter(
         return True
     if idx - neighbor_days < 0 or idx + neighbor_days >= len(highs):
         return False
-    center = pd.to_numeric(pd.Series([highs.iloc[idx]]), errors="coerce").iloc[0]
-    if pd.isna(center) or float(center) <= 0:
+    values = highs.to_numpy(dtype=float, copy=False)
+    center = values[idx]
+    if np.isnan(center) or float(center) <= 0:
         return False
-    left = pd.to_numeric(highs.iloc[idx - neighbor_days : idx], errors="coerce")
-    right = pd.to_numeric(highs.iloc[idx + 1 : idx + neighbor_days + 1], errors="coerce")
-    neighbors = pd.concat([left, right]).dropna()
-    if len(neighbors) != neighbor_days * 2:
+    left = values[idx - neighbor_days : idx]
+    right = values[idx + 1 : idx + neighbor_days + 1]
+    if np.isnan(left).any() or np.isnan(right).any():
         return False
-    reference_high = float(neighbors.max())
+    reference_high = float(max(left.max(), right.max()))
     prominence_ratio = (float(center) - reference_high) / float(center)
     return prominence_ratio >= float(min_peak_prominence_ratio)
 
@@ -158,7 +214,7 @@ def _select_lowest_trough_index(
         idx
         for idx in trough_indices
         if start_exclusive < idx < end_exclusive
-        and pd.notna(pd.to_numeric(lows.iloc[idx], errors="coerce"))
+        and not np.isnan(pd.to_numeric(lows.iloc[idx], errors="coerce"))
     ]
     if not eligible:
         return None
@@ -199,7 +255,7 @@ def _is_two_lowest_points_in_window(
     eligible = [
         (float(lows.iloc[idx]), idx)
         for idx in range(latest_idx)
-        if pd.notna(pd.to_numeric(lows.iloc[idx], errors="coerce"))
+        if not np.isnan(pd.to_numeric(lows.iloc[idx], errors="coerce"))
     ]
     if len(eligible) < 2:
         return False
@@ -282,6 +338,11 @@ def match_ultra_short_hot_breakout(
     min_b_peak_prominence_ratio: float = 0.0,
     post_d_peak_neighbor_days: int = 0,
     pullback_confirm_lookback_days: int = 10,
+    adaptive_exit_enabled: bool = False,
+    adaptive_exit_stop_atr_mult: float = 2.0,
+    adaptive_exit_confirm_low_atr_buffer: float = 0.5,
+    adaptive_exit_take_profit_r: float = 1.0,
+    adaptive_exit_max_stop_loss_pct: float = 0.0,
     *,
     pattern_detail_cls: Any,
     build_scan_outcome: Callable[..., Any],
@@ -384,6 +445,16 @@ def match_ultra_short_hot_breakout(
             neckline_price=neckline_price,
             pattern_detail_cls=pattern_detail_cls,
         )
+        if adaptive_exit_enabled:
+            _apply_adaptive_exit_plan(
+                frame,
+                detail,
+                latest_idx,
+                stop_atr_mult=adaptive_exit_stop_atr_mult,
+                confirm_low_atr_buffer=adaptive_exit_confirm_low_atr_buffer,
+                take_profit_r=adaptive_exit_take_profit_r,
+                max_stop_loss_pct=adaptive_exit_max_stop_loss_pct,
+            )
         outcome = _finalize_breakout_or_watch(
             frame=frame,
             detail=detail,

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import ipaddress
 import json
 import os
+import shutil
 import time
 import re
 import socket
@@ -115,6 +116,11 @@ class PatternTemplate:
     min_b_peak_prominence_ratio: float = 0.0
     post_d_peak_neighbor_days: int = 0
     min_breakout_over_d_ratio: float = 0.0
+    adaptive_exit_enabled: bool = False
+    adaptive_exit_stop_atr_mult: float = 2.0
+    adaptive_exit_confirm_low_atr_buffer: float = 0.5
+    adaptive_exit_take_profit_r: float = 1.0
+    adaptive_exit_max_stop_loss_pct: float = 0.0
     amount_rank_min: int = 0
     amount_rank_max: int = 0
     # 窗口区间扫描：window_days_max > 0 时，在 [window_days, window_days_max] 遍历
@@ -341,14 +347,21 @@ class PatternDetail:
     pullback_date: str = ""
     pullback_low: Optional[float] = None
     pullback_close: Optional[float] = None
+    dynamic_take_profit_price: float = 0.0
+    dynamic_stop_loss_price: float = 0.0
+    dynamic_atr14: float = 0.0
 
     @property
     def take_profit_price(self) -> float:
         """止盈价 = 突破价 + B点价格 - (C点+D点)/2"""
+        if self.dynamic_take_profit_price > 0:
+            return self.dynamic_take_profit_price
         return self.breakout_price + self.point_b_price - (self.point_c_price + self.point_d_price) / 2.0
 
     def stop_loss_price(self, ratio: float = 0.06) -> float:
         """止损价 = 突破价 × (1 - ratio)"""
+        if self.dynamic_stop_loss_price > 0:
+            return self.dynamic_stop_loss_price
         return self.breakout_price * (1.0 - ratio)
 
     def max_entry_price(self, premium: float = 0.05) -> float:
@@ -1073,6 +1086,8 @@ def run_neckline_breakout_scan(
     if history_lookback_days is not None:
         cfg.history_lookback_days = max(int(history_lookback_days), cfg.max_window_days, 30)
     target_date = _normalize_trade_date(trade_date)
+    removed_count = _clear_scan_cache(cfg, trade_date=target_date)
+    print(f"[形态筛选] 已清理当日扫描缓存({target_date})：删除 {removed_count} 个旧结果文件。")
     universe = _load_universe(
         board_filter=board_filter,
         apply_spot_prefilter=False,
@@ -1103,11 +1118,7 @@ def run_neckline_breakout_scan(
         if use_intraday is None
         else bool(use_intraday)
     ) and pd.Timestamp(target_date).date() == datetime.now(tz=CST).date()
-    cache_state = (
-        {}
-        if should_use_intraday
-        else _load_scan_cache(cfg, board_filter=board_filter, trade_date=target_date)
-    )
+    cache_state = {}
     processed_symbols = {str(item).strip() for item in cache_state.get("processed_symbols", []) if str(item).strip()}
     matched_map: Dict[str, dict] = {}
     watchlist_map: Dict[str, dict] = {}
@@ -1496,6 +1507,36 @@ def _load_scan_cache(cfg: PatternScanConfig, board_filter: str | None, trade_dat
     if payload.get("cache_signature") != _scan_cache_signature(cfg):
         return {}
     return payload
+
+
+def _clear_scan_cache(cfg: PatternScanConfig, trade_date: str) -> int:
+    date_folder = os.path.join(cfg.cache_dir, trade_date)
+    removed_count = 0
+    if os.path.isdir(date_folder):
+        for _, _, filenames in os.walk(date_folder):
+            removed_count += len(filenames)
+        shutil.rmtree(date_folder, ignore_errors=True)
+
+    legacy_prefix = f"{trade_date}_"
+    try:
+        legacy_names = [
+            name
+            for name in os.listdir(cfg.cache_dir)
+            if name.startswith(legacy_prefix) and name.endswith(".json")
+        ]
+    except FileNotFoundError:
+        legacy_names = []
+
+    for name in legacy_names:
+        path = os.path.join(cfg.cache_dir, name)
+        try:
+            os.remove(path)
+            removed_count += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+    return removed_count
 
 
 def _save_scan_cache(
@@ -2093,6 +2134,11 @@ def _match_pattern_templates(
                 min_bd_amplitude_ratio=template.min_bd_amplitude_ratio,
                 min_b_peak_prominence_ratio=template.min_b_peak_prominence_ratio,
                 post_d_peak_neighbor_days=template.post_d_peak_neighbor_days,
+                adaptive_exit_enabled=template.adaptive_exit_enabled,
+                adaptive_exit_stop_atr_mult=template.adaptive_exit_stop_atr_mult,
+                adaptive_exit_confirm_low_atr_buffer=template.adaptive_exit_confirm_low_atr_buffer,
+                adaptive_exit_take_profit_r=template.adaptive_exit_take_profit_r,
+                adaptive_exit_max_stop_loss_pct=template.adaptive_exit_max_stop_loss_pct,
                 pullback_confirm_lookback_days=cfg.pullback_confirm_lookback_days,
             )
             if outcome.matched is not None:
@@ -2484,6 +2530,14 @@ def _scan_backtest_symbol_frame(
     rows: List[dict] = []
     if not eligible_rank_by_date:
         return rows
+    max_template_window = max(
+        (
+            template.window_days_max
+            if template.window_days_max > template.window_days
+            else template.window_days
+        )
+        for template in scan_cfg.templates
+    )
 
     for signal_dt, amount_rank in sorted(eligible_rank_by_date.items()):
         normalized_signal_dt = pd.Timestamp(signal_dt).normalize()
@@ -2497,7 +2551,8 @@ def _scan_backtest_symbol_frame(
         signal_pos = int(signal_pos)
         if signal_pos + 1 < scan_cfg.min_window_days or amount_rank <= 0:
             continue
-        upto_signal = frame.iloc[: signal_pos + 1]
+        window_start = max(0, signal_pos + 1 - max_template_window)
+        upto_signal = frame.iloc[window_start : signal_pos + 1]
         outcome, _ = _match_pattern_templates(
             frame=upto_signal,
             cfg=scan_cfg,
@@ -2822,6 +2877,11 @@ def _matches_dynamic_neckline_breakout(
     min_b_peak_prominence_ratio: float = 0.0,
     post_d_peak_neighbor_days: int = 0,
     pullback_confirm_lookback_days: int = 10,
+    adaptive_exit_enabled: bool = False,
+    adaptive_exit_stop_atr_mult: float = 2.0,
+    adaptive_exit_confirm_low_atr_buffer: float = 0.5,
+    adaptive_exit_take_profit_r: float = 1.0,
+    adaptive_exit_max_stop_loss_pct: float = 0.0,
 ) -> PatternScanOutcome:
     return match_ultra_short_hot_breakout(
         frame=frame,
@@ -2839,6 +2899,11 @@ def _matches_dynamic_neckline_breakout(
         min_b_peak_prominence_ratio=min_b_peak_prominence_ratio,
         post_d_peak_neighbor_days=post_d_peak_neighbor_days,
         pullback_confirm_lookback_days=pullback_confirm_lookback_days,
+        adaptive_exit_enabled=adaptive_exit_enabled,
+        adaptive_exit_stop_atr_mult=adaptive_exit_stop_atr_mult,
+        adaptive_exit_confirm_low_atr_buffer=adaptive_exit_confirm_low_atr_buffer,
+        adaptive_exit_take_profit_r=adaptive_exit_take_profit_r,
+        adaptive_exit_max_stop_loss_pct=adaptive_exit_max_stop_loss_pct,
         pattern_detail_cls=PatternDetail,
         build_scan_outcome=PatternScanOutcome,
         is_local_peak=_is_local_peak,
@@ -2866,6 +2931,11 @@ def _matches_neckline_breakout(
     min_b_peak_prominence_ratio: float = 0.0,
     post_d_peak_neighbor_days: int = 0,
     min_breakout_over_d_ratio: float = 0.0,
+    adaptive_exit_enabled: bool = False,
+    adaptive_exit_stop_atr_mult: float = 2.0,
+    adaptive_exit_confirm_low_atr_buffer: float = 0.5,
+    adaptive_exit_take_profit_r: float = 1.0,
+    adaptive_exit_max_stop_loss_pct: float = 0.0,
     pullback_confirm_lookback_days: int = 10,
 ) -> "PatternScanOutcome":
     if frame is None or frame.empty or len(frame) < max(b_window_days if b_window_days > 0 else 10, recent_low_window_days if recent_low_window_days > 0 else 10, 10):
@@ -2873,11 +2943,20 @@ def _matches_neckline_breakout(
     if "Close" not in frame.columns or "High" not in frame.columns or "Low" not in frame.columns:
         return PatternScanOutcome(matched=None, watch=None)
 
-    frame = frame.copy()
-    frame["Close"] = pd.to_numeric(frame["Close"], errors="coerce")
-    frame["High"] = pd.to_numeric(frame["High"], errors="coerce")
-    frame["Low"] = pd.to_numeric(frame["Low"], errors="coerce")
-    frame = frame.dropna(subset=["Close", "High", "Low"])
+    price_cols = ["Close", "High", "Low"]
+    if all(pd.api.types.is_numeric_dtype(frame[col]) for col in price_cols):
+        has_nan = (
+            np.isnan(frame["Close"].to_numpy(dtype=float, copy=False)).any()
+            or np.isnan(frame["High"].to_numpy(dtype=float, copy=False)).any()
+            or np.isnan(frame["Low"].to_numpy(dtype=float, copy=False)).any()
+        )
+        frame = frame.dropna(subset=price_cols) if has_nan else frame
+    else:
+        frame = frame.copy()
+        frame["Close"] = pd.to_numeric(frame["Close"], errors="coerce")
+        frame["High"] = pd.to_numeric(frame["High"], errors="coerce")
+        frame["Low"] = pd.to_numeric(frame["Low"], errors="coerce")
+        frame = frame.dropna(subset=price_cols)
     if len(frame) < max(b_window_days if b_window_days > 0 else 10, recent_low_window_days if recent_low_window_days > 0 else 10, 10):
         return PatternScanOutcome(matched=None, watch=None)
 
@@ -2898,6 +2977,11 @@ def _matches_neckline_breakout(
             min_b_peak_prominence_ratio=min_b_peak_prominence_ratio,
             post_d_peak_neighbor_days=post_d_peak_neighbor_days,
             pullback_confirm_lookback_days=pullback_confirm_lookback_days,
+            adaptive_exit_enabled=adaptive_exit_enabled,
+            adaptive_exit_stop_atr_mult=adaptive_exit_stop_atr_mult,
+            adaptive_exit_confirm_low_atr_buffer=adaptive_exit_confirm_low_atr_buffer,
+            adaptive_exit_take_profit_r=adaptive_exit_take_profit_r,
+            adaptive_exit_max_stop_loss_pct=adaptive_exit_max_stop_loss_pct,
         )
 
     closes = frame["Close"]
@@ -3043,11 +3127,15 @@ def _is_local_peak(series: pd.Series, idx: int, neighbor_days: int) -> bool:
         return True
     if idx - neighbor_days < 0 or idx + neighbor_days >= len(series):
         return False
-    value = float(series.iloc[idx])
-    left = pd.to_numeric(series.iloc[idx - neighbor_days : idx], errors="coerce")
-    right = pd.to_numeric(series.iloc[idx + 1 : idx + neighbor_days + 1], errors="coerce")
-    neighbors = pd.concat([left, right]).dropna()
-    return len(neighbors) == neighbor_days * 2 and bool((neighbors < value).all())
+    values = series.to_numpy(dtype=float, copy=False)
+    value = values[idx]
+    if np.isnan(value):
+        return False
+    left = values[idx - neighbor_days : idx]
+    right = values[idx + 1 : idx + neighbor_days + 1]
+    if np.isnan(left).any() or np.isnan(right).any():
+        return False
+    return bool((left < value).all() and (right < value).all())
 
 
 def _is_local_trough(series: pd.Series, idx: int, neighbor_days: int) -> bool:
@@ -3056,11 +3144,15 @@ def _is_local_trough(series: pd.Series, idx: int, neighbor_days: int) -> bool:
         return True
     if idx - neighbor_days < 0 or idx + neighbor_days >= len(series):
         return False
-    value = float(series.iloc[idx])
-    left = pd.to_numeric(series.iloc[idx - neighbor_days : idx], errors="coerce")
-    right = pd.to_numeric(series.iloc[idx + 1 : idx + neighbor_days + 1], errors="coerce")
-    neighbors = pd.concat([left, right]).dropna()
-    return len(neighbors) == neighbor_days * 2 and bool((neighbors > value).all())
+    values = series.to_numpy(dtype=float, copy=False)
+    value = values[idx]
+    if np.isnan(value):
+        return False
+    left = values[idx - neighbor_days : idx]
+    right = values[idx + 1 : idx + neighbor_days + 1]
+    if np.isnan(left).any() or np.isnan(right).any():
+        return False
+    return bool((left > value).all() and (right > value).all())
 
 
 def _calc_neckline_price(
